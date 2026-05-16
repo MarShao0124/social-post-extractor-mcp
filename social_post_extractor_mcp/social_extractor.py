@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import asyncio
@@ -39,7 +40,13 @@ DOUYIN_MOBILE_HEADERS = {
 }
 
 DEFAULT_ASR_PROVIDER = "bailian"
-DEFAULT_ASR_MODEL = "paraformer-v2"
+# NOTE(local-fork): upstream default is "paraformer-v2", but its async transcription
+# endpoint requires a plural `input.file_urls`, while this fork submits singular
+# `input.file_url` (see run_dashscope_filetrans_task). With paraformer-v2 the task
+# never returns valid output and the poll loop runs until timeout. Default to the
+# schema-compatible model so an env reset (e.g. re-registering the mcporter alias)
+# cannot silently reintroduce the hang. See 学习笔记/agent-reach.md §3/§5.
+DEFAULT_ASR_MODEL = "qwen3-asr-flash-filetrans"
 DEFAULT_VISION_PROVIDER = "bailian"
 DEFAULT_CLEAN_PROVIDER = "bailian"
 DEFAULT_DASHSCOPE_SHORT_ASR_MODEL = "qwen3-asr-flash"
@@ -917,13 +924,23 @@ class DashScopeASRProvider:
             raise
 
     def _transcribe_via_cloud_mirror(self, post: SocialPost, *, api_key: str, model: str) -> str:
-        oss_url = stream_remote_media_to_dashscope_oss(
-            source_url=post.video_url,
-            api_key=api_key,
-            model_name=model,
-            filename_hint=_default_dashscope_media_filename(post),
-            referer_url=post.page_url or post.resolved_url,
-        )
+        # Local ffmpeg preprocessing: download video → extract audio → upload only the audio.
+        # The previous implementation streamed the full remote video into DashScope OSS,
+        # which is ~141MB for a typical Douyin clip and triggers OSS 60s read timeout from
+        # outside China. Extracting audio first shrinks the upload by ~30-50x and uses the
+        # same async ASR path on the cloud side.
+        media_filename = _default_dashscope_media_filename(post)
+        audio_filename = Path(media_filename).with_suffix(".mp3").name
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            video_path = download_binary(post.video_url, tmp_path / f"{post.post_id}.mp4")
+            audio_path = extract_audio(video_path, tmp_path / f"{post.post_id}.mp3")
+            oss_url = upload_local_file_to_dashscope_oss(
+                file_path=audio_path,
+                api_key=api_key,
+                model_name=model,
+                filename_hint=audio_filename,
+            )
         if model == DEFAULT_DASHSCOPE_SHORT_ASR_MODEL:
             return run_dashscope_multimodal_asr(
                 oss_url=oss_url,
@@ -1934,6 +1951,68 @@ def stream_remote_media_to_dashscope_oss(
             return f"oss://{key}"
 
 
+def upload_local_file_to_dashscope_oss(
+    *,
+    file_path: Path,
+    api_key: str,
+    model_name: str,
+    filename_hint: Optional[str] = None,
+) -> str:
+    """Upload an already-on-disk file to DashScope's temporary OSS bucket.
+
+    Mirrors stream_remote_media_to_dashscope_oss but reads from a local Path
+    instead of streaming a remote URL. Used by the DashScope ASR path after
+    local ffmpeg audio extraction shrinks the payload (e.g. 141MB video → 3MB mp3).
+    """
+    policy_data = get_dashscope_upload_policy(api_key, model_name)
+    file_size = file_path.stat().st_size
+    if file_size <= 0:
+        raise RuntimeError(f"本地文件大小为 0，无法上传到 DashScope 临时存储: {file_path}")
+    file_name = filename_hint or file_path.name
+    content_type, _ = mimetypes.guess_type(file_name)
+    content_type = content_type or "application/octet-stream"
+    key = f"{policy_data['upload_dir'].rstrip('/')}/{file_name}"
+
+    def _file_chunks() -> Any:
+        with file_path.open("rb") as file_obj:
+            while True:
+                chunk = file_obj.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    form = StreamingMultipartForm(
+        boundary=f"dashscope-{uuid.uuid4().hex}",
+        fields=[
+            ("OSSAccessKeyId", policy_data["oss_access_key_id"]),
+            ("Signature", policy_data["signature"]),
+            ("policy", policy_data["policy"]),
+            ("x-oss-object-acl", policy_data["x_oss_object_acl"]),
+            ("x-oss-forbid-overwrite", policy_data["x_oss_forbid_overwrite"]),
+            ("key", key),
+            ("success_action_status", "200"),
+        ],
+        file_field_name="file",
+        file_name=file_name,
+        file_content_type=content_type,
+        file_chunks=_file_chunks(),
+        file_size=file_size,
+    )
+    with requests.Session() as upload_session:
+        upload_session.trust_env = False
+        upload_response = upload_session.post(
+            policy_data["upload_host"],
+            data=form,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={form.boundary}",
+                "Content-Length": str(len(form)),
+            },
+            timeout=(60, 1800),
+        )
+    upload_response.raise_for_status()
+    return f"oss://{key}"
+
+
 def run_dashscope_multimodal_asr(*, oss_url: str, api_key: str, model: str) -> str:
     import dashscope
 
@@ -2142,7 +2221,11 @@ def _rewrite_douyin_cdn(url: str) -> str:
 def download_binary(url: str, destination: Path) -> Path:
     # 优先使用稳定的 aweme.snssdk.com CDN
     url = _rewrite_douyin_cdn(url)
-    response = requests.get(_normalize_media_url(url), headers=HEADERS, timeout=60, stream=True)
+    # timeout=(connect, read) — scalar 60s would cap a single chunk read, not the
+    # whole transfer; a 141MB video over a slow link needs a generous read budget.
+    response = requests.get(
+        _normalize_media_url(url), headers=HEADERS, timeout=(60, 1800), stream=True
+    )
     response.raise_for_status()
     with destination.open("wb") as file_obj:
         for chunk in response.iter_content(chunk_size=8192):
@@ -2171,6 +2254,241 @@ def extract_wav_audio(video_path: Path, audio_path: Path) -> Path:
         .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
     )
     return audio_path
+
+
+# yt-dlp stderr fragments that mean *every* download path will fail (subtitles
+# AND audio). Detecting these lets us fail fast instead of burning ~10 min in
+# the ASR fallback only to hit the same wall.
+_YTDLP_FATAL_MARKERS: tuple[str, ...] = (
+    "not made this video available in your country",
+    "blocked it in your country",
+    "geo restricted",
+    "geo-restricted",
+    "video is not available",
+    "video unavailable",
+    "private video",
+    "sign in to confirm your age",
+    "this video has been removed",
+    "members only",
+    "members-only",
+    "this content isn't available",
+    "login required",
+)
+
+
+def _ytdlp_fatal_reason(stderr: str) -> Optional[str]:
+    """Return the first matching fatal marker found in yt-dlp stderr, else None."""
+    low = stderr.lower()
+    for marker in _YTDLP_FATAL_MARKERS:
+        if marker in low:
+            return marker
+    return None
+
+
+def _parse_vtt_to_text(vtt_path: Path) -> str:
+    """Strip WebVTT timing info and cue identifiers, return plain text."""
+    lines: list[str] = []
+    for raw in vtt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("WEBVTT", "NOTE", "STYLE", "Kind:", "Language:")):
+            continue
+        if "-->" in line:
+            continue
+        if line.isdigit():
+            continue
+        # YouTube auto-captions repeat the same line across adjacent cues. Dedupe
+        # only *consecutive* duplicates — a global set would wrongly drop
+        # legitimate repeats (e.g. a song chorus appearing again later).
+        if lines and line == lines[-1]:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_youtube_transcript_value(
+    url: str,
+    *,
+    prefer_subtitles: bool = True,
+    asr_model: Optional[str] = None,
+    sub_langs: str = "zh-Hans,zh,en",
+    asr_timeout_sec: int = 1200,
+) -> dict[str, Any]:
+    """Extract transcript from a YouTube / Bilibili / generic video URL.
+
+    Strategy:
+        1. Pull metadata via yt-dlp (cheap, ~1s).
+        2. If `prefer_subtitles` and platform has manual or auto captions, download
+           the .vtt and parse text. No ASR billing.
+        3. Otherwise extract audio (mp3, ~10MB/15min) via yt-dlp + ffmpeg, upload
+           to DashScope OSS, run qwen3-asr-flash-filetrans async ASR.
+
+    The qwen3-asr-flash-filetrans model is the only ASR SKU in this codebase's
+    helpers that accepts oss:// URLs via X-DashScope-OssResourceResolve. Other
+    models (qwen3-asr-flash short, paraformer-v2) have incompatible schemas.
+    """
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        raise RuntimeError("yt-dlp 未安装。运行：pipx install yt-dlp")
+
+    meta_proc = subprocess.run(
+        [yt_dlp, "--dump-json", "--skip-download", url],
+        capture_output=True, text=True, timeout=60,
+    )
+    if meta_proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp 元数据获取失败: {meta_proc.stderr[:300]}")
+    meta = json.loads(meta_proc.stdout)
+    video_id = meta["id"]
+    title = meta.get("title", "")
+    channel = meta.get("channel") or meta.get("uploader", "")
+    duration_sec = meta.get("duration", 0)
+    upload_date = meta.get("upload_date")
+    view_count = meta.get("view_count")
+
+    base = {
+        "status": "success",
+        "video_id": video_id,
+        "title": title,
+        "channel": channel,
+        "duration_sec": duration_sec,
+        "upload_date": upload_date,
+        "view_count": view_count,
+        "url": url,
+    }
+
+    if prefer_subtitles:
+        subs = meta.get("subtitles") or {}
+        auto_subs = meta.get("automatic_captions") or {}
+        if subs or auto_subs:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                sub_proc = subprocess.run(
+                    [yt_dlp, "--write-sub", "--write-auto-sub",
+                     "--sub-lang", sub_langs,
+                     "--convert-subs", "vtt",
+                     "--skip-download",
+                     "-o", f"{tmpdir}/%(id)s",
+                     url],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if sub_proc.returncode != 0:
+                    reason = _ytdlp_fatal_reason(sub_proc.stderr)
+                    if reason:
+                        raise RuntimeError(
+                            f"yt-dlp 字幕下载失败且属于不可恢复错误（{reason}）；"
+                            f"ASR 回退也会因同样原因失败，提前终止。"
+                            f"stderr: {sub_proc.stderr[:300]}"
+                        )
+                    # Non-fatal (e.g. simply no subtitles for requested langs):
+                    # fall through to ASR as designed.
+                vtts = sorted(Path(tmpdir).glob(f"{video_id}*.vtt"))
+                if vtts:
+                    return {
+                        **base,
+                        "transcript_source": "subtitles",
+                        "subtitle_lang": vtts[0].stem.split(".")[-1],
+                        "transcript": _parse_vtt_to_text(vtts[0]),
+                    }
+
+    api_key = first_env("BAILIAN_API_KEY", "DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "BAILIAN_API_KEY / DASHSCOPE_API_KEY 未设置，无法走 ASR 回退。"
+            "在 mcporter 配置里添加 --env BAILIAN_API_KEY=sk-xxx"
+        )
+
+    model = asr_model or "qwen3-asr-flash-filetrans"
+    # Auto-detect language from yt-dlp metadata to avoid SUCCESS_WITH_NO_VALID_FRAGMENT
+    # when Chinese model misses English audio (or vice versa).
+    meta_lang = (meta.get("language") or "").lower()
+    if meta_lang.startswith("zh"):
+        asr_lang = "zh"
+    elif meta_lang.startswith("en"):
+        asr_lang = "en"
+    elif meta_lang.startswith("ja"):
+        asr_lang = "ja"
+    else:
+        asr_lang = "zh"  # default for our Chinese-heavy use case
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_proc = subprocess.run(
+            [yt_dlp, "-f", "bestaudio", "-x", "--audio-format", "mp3",
+             "-o", f"{tmpdir}/%(id)s.%(ext)s",
+             url],
+            capture_output=True, text=True, timeout=600,
+        )
+        if audio_proc.returncode != 0:
+            raise RuntimeError(f"yt-dlp 音轨提取失败: {audio_proc.stderr[:300]}")
+        audio_path = Path(tmpdir) / f"{video_id}.mp3"
+        if not audio_path.exists():
+            raise RuntimeError(f"音轨文件未生成: {audio_path}")
+
+        oss_url = upload_local_file_to_dashscope_oss(
+            file_path=audio_path,
+            api_key=api_key,
+            model_name=model,
+            filename_hint=audio_path.name,
+        )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable",
+            "X-DashScope-OssResourceResolve": "enable",
+        }
+        submit = requests.post(
+            "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
+            headers=headers,
+            json={
+                "model": model,
+                "input": {"file_url": oss_url},
+                "parameters": {"language": asr_lang, "enable_itn": False},
+            },
+            timeout=60,
+        )
+        submit.raise_for_status()
+        task_id = submit.json()["output"]["task_id"]
+
+        deadline = time.monotonic() + asr_timeout_sec
+        poll: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            poll = requests.get(
+                f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
+                headers=headers, timeout=60,
+            ).json()
+            # DashScope occasionally returns a partial payload (no `output` or
+            # no `task_status`) on transient states or rate limits. Hard
+            # indexing would raise a bare KeyError that hides the real body;
+            # treat a missing status as "still pending" and keep polling.
+            output = poll.get("output") or {}
+            status = output.get("task_status")
+            if status is None:
+                continue
+            if status == "SUCCEEDED":
+                result = output.get("result") or {}
+                tr_url = result.get("transcription_url")
+                if not tr_url:
+                    raise RuntimeError(
+                        f"DashScope ASR 报告 SUCCEEDED 但缺少 transcription_url: {poll}"
+                    )
+                tr = requests.get(tr_url, timeout=60).json()
+                texts: list[str] = []
+                for tw in tr.get("transcripts", []):
+                    for s in tw.get("sentences", []):
+                        text = s.get("text", "")
+                        if text:
+                            texts.append(text)
+                billed_seconds = (poll.get("usage") or {}).get("seconds")
+                return {
+                    **base,
+                    "transcript_source": "asr",
+                    "asr_model": model,
+                    "asr_billed_seconds": billed_seconds,
+                    "transcript": "\n".join(texts),
+                }
+            if status == "FAILED":
+                raise RuntimeError(f"DashScope ASR 任务失败: {poll}")
+        raise RuntimeError(
+            f"DashScope ASR 超时 (> {asr_timeout_sec}s)；最后一次 poll 返回: {poll}"
+        )
 
 
 def build_volcengine_request_payload(audio_path: Path, context: ExtractionContext, user_id: str) -> dict[str, Any]:

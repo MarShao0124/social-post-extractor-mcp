@@ -11,7 +11,12 @@ from typing import Optional
 from mcp.server.fastmcp import Context, FastMCP
 
 from .env_loader import load_default_env_files
-from .social_extractor import DEFAULT_ASR_PROVIDER, OwnerAnalyticsCommandProvider, SocialExtractorService
+from .social_extractor import (
+    DEFAULT_ASR_PROVIDER,
+    OwnerAnalyticsCommandProvider,
+    SocialExtractorService,
+    extract_youtube_transcript_value,
+)
 
 
 load_default_env_files(Path(__file__).resolve().parents[1])
@@ -271,6 +276,30 @@ def get_douyin_download_link(share_link: str) -> str:
             ensure_ascii=False,
             indent=2,
         )
+    except Exception as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def youtube_extract_transcript(
+    url: str,
+    prefer_subtitles: bool = True,
+    asr_model: Optional[str] = None,
+) -> str:
+    """提取 YouTube / B站 / 任意 yt-dlp 支持平台的视频文本。
+
+    策略：
+        - prefer_subtitles=True (默认): 先用 yt-dlp 抓平台字幕 (.subtitles 或 .automatic_captions)，
+          有字幕则解析 .vtt 返回，无 ASR 费用。
+        - 无字幕回退: yt-dlp 抽 mp3 音轨 → 上传百炼 OSS → qwen3-asr-flash-filetrans 异步 ASR。
+
+    返回 JSON 含 video_id / title / channel / duration_sec / transcript_source ('subtitles' 或 'asr') / transcript。
+    """
+    try:
+        result = extract_youtube_transcript_value(
+            url, prefer_subtitles=prefer_subtitles, asr_model=asr_model,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
 

@@ -1,5 +1,16 @@
 # Social Post Extractor MCP
 
+> ## 🔱 这是一个 Fork（含本地补丁）
+>
+> **上游原仓库**：[`JNHFlow21/social-post-extractor-mcp`](https://github.com/JNHFlow21/social-post-extractor-mcp)
+> **本 Fork**：[`MarShao0124/social-post-extractor-mcp`](https://github.com/MarShao0124/social-post-extractor-mcp) · 分支 `ffmpeg-and-youtube`
+>
+> 这个 Fork 在跨国（中国大陆以外）网络环境下修复了上游 ASR 路径必然超时的问题，并新增了 YouTube/Bilibili 字幕优先的转写工具。所有改动集中在
+> `social_post_extractor_mcp/social_extractor.py` 与 `server.py` 两个文件，**与上游差异详见下方
+> [「与上游的差异」](#与上游的差异fork-changelog)章节**。
+>
+> ⚠️ 这些补丁仅存在于本 Fork。若 `git pull` 上游，需重新打补丁（建议始终基于 `ffmpeg-and-youtube` 分支工作）。
+
 统一提取抖音、小红书、Bilibili 内容的 MCP Server。它可以解析作者信息、作品信息、公开视频指标、字幕/转写稿、小红书图文图片内容，并在需要时通过浏览器登录态拉取自己账号的复盘数据。
 
 默认产物：
@@ -390,6 +401,51 @@ mcporter call 'douyin.parse_social_post_info(share_link: "平台链接")'
 - 处理别人的公开视频时可以走云端 ASR；处理自己账号复盘时默认只抓数据。
 - 结果尽量保留结构化字段，不要只保留自然语言摘要。
 
+## 与上游的差异（Fork Changelog）
+
+相对上游 [`JNHFlow21/social-post-extractor-mcp`](https://github.com/JNHFlow21/social-post-extractor-mcp)
+（fork 基点：`b23bf5a Update installation instructions in README.md`），本 Fork 在
+`social_post_extractor_mcp/social_extractor.py` 与 `social_post_extractor_mcp/server.py`
+两个文件上做了 4 处改动。**功能行为均向后兼容**：原有工具签名不变，仅修复超时、新增工具、改默认值。
+
+### 1. ffmpeg 音轨预提取（修复跨国 ASR 必超时）
+
+- **改 `DashScopeASRProvider._transcribe_via_cloud_mirror`**：流程从「streaming 上传整段视频到百炼北京 OSS」
+  改为「`download_binary` 下载视频 → `extract_audio` 抽 mp3 → 只上传音轨」。
+- **新增 `upload_local_file_to_dashscope_oss()`**：从本地磁盘分块上传，对应原 `stream_remote_media_to_dashscope_oss`
+  的远程流式版本。
+- **为什么**：上游把 ~141MB 视频跨国 stream 到北京 OSS，必然撞 60s read timeout；抽完音轨 ~3MB，
+  上传体积缩小 30–50×，秒传。云端仍走同一异步 ASR 端点。
+
+### 2. `download_binary` 超时语义修正
+
+- `requests.get(..., timeout=60)` → `timeout=(60, 1800)`。
+- **为什么**：标量 `60` 限制的是单次 chunk read，不是整段传输；大文件 + 慢链路下单次 read 也可能 <60s
+  但整体远超，旧写法语义错误。改成 `(connect, read)` 元组，给慢链路足够 read 预算。
+
+### 3. 新增 `youtube_extract_transcript` 工具（YouTube / Bilibili / 任意 yt-dlp 平台）
+
+- **`server.py`**：新增 `@mcp.tool() youtube_extract_transcript(url, prefer_subtitles, asr_model)`。
+- **`social_extractor.py`**：新增 worker `extract_youtube_transcript_value()` +
+  `_parse_vtt_to_text()`（WebVTT 去时间轴/去连续重复行）+ `_ytdlp_fatal_reason()` /
+  `_YTDLP_FATAL_MARKERS`（地区封锁/私有/会员限定等不可恢复错误**提前快速失败**，不浪费 ~10 分钟跑 ASR
+  撞同一堵墙）。
+- **行为**：先用 yt-dlp 元数据探测平台字幕 → 有则下载 `.vtt` 解析（**零 ASR 费用**）→ 无字幕才抽 mp3
+  上传走 `qwen3-asr-flash-filetrans` 异步 ASR。**从元数据自动检测语言**（zh/en/ja），避免中文模型识别
+  英文音频时的 `SUCCESS_WITH_NO_VALID_FRAGMENT`。
+- 返回 JSON 含 `video_id` / `title` / `channel` / `duration_sec` / `transcript_source`
+  (`"subtitles"` 或 `"asr"`) / `transcript` 等。
+
+### 4. 防回退：`DEFAULT_ASR_MODEL` 默认值硬化
+
+- `DEFAULT_ASR_MODEL`：`"paraformer-v2"` → `"qwen3-asr-flash-filetrans"`。
+- **为什么**：上游默认 `paraformer-v2` 的异步转写端点要求复数 `input.file_urls`，而本仓库的提交代码发的是
+  单数 `input.file_url`，schema 不匹配 → 任务永不返回有效结果 → poll 循环跑到超时。把代码默认值改成
+  schema 兼容的模型，确保即使环境变量被重置（如重新注册 mcporter alias）也不会静默重新引入该挂死。
+
+> 调用与运维细节见使用方个人笔记 `学习笔记/agent-reach.md`（不在本仓库）。
+
 ## License
 
-Apache-2.0
+Apache-2.0（沿用上游）。本 Fork 改动同样以 Apache-2.0 释出。原始版权归上游作者
+[`JNHFlow21`](https://github.com/JNHFlow21) 所有。
