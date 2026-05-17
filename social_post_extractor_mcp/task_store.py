@@ -103,6 +103,16 @@ def resolve_status(task_id: str) -> dict[str, Any]:
     status = data.get("status")
     pid = data.get("pid")
     if (
+        status == "queued"
+        and (time.time() - data.get("updated_at", 0)) > _DEAD_AFTER_SEC
+    ):
+        return {
+            "status": "failed",
+            "task_id": task_id,
+            "error": "worker failed to start (no progress); see log_path",
+            "log_path": data.get("log_path"),
+        }
+    if (
         status not in _TERMINAL
         and pid
         and (time.time() - data.get("updated_at", 0)) > _DEAD_AFTER_SEC

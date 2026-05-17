@@ -53,7 +53,9 @@ def run(task_id: str) -> None:
                       progress=1.0, transcript=transcript, metadata=metadata)
     except Exception as exc:  # noqa: BLE001 - worker boundary, record & exit
         ts.log_path(task_id).parent.mkdir(parents=True, exist_ok=True)
-        ts.log_path(task_id).write_text(traceback.format_exc(), encoding="utf-8")
+        with open(ts.log_path(task_id), "a", encoding="utf-8") as _lf:
+            _lf.write("\n--- worker exception ---\n")
+            _lf.write(traceback.format_exc())
         ts.write_task(task_id, status="failed", stage="done",
                       error=str(exc)[:2000], log_path=str(ts.log_path(task_id)))
 

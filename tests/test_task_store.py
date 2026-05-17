@@ -71,6 +71,22 @@ def test_resolve_dead_worker(store):
     assert "worker exited" in r["error"]
 
 
+def test_resolve_stale_queued_marked_failed(store):
+    task_id = ts.new_task("u", "douyin")  # status=queued, pid=None
+    data = ts.read_task(task_id)
+    data["updated_at"] = time.time() - 200
+    ts._atomic_write(ts.task_path(task_id), data)
+    r = ts.resolve_status(task_id)
+    assert r["status"] == "failed"
+    assert "failed to start" in r["error"]
+
+
+def test_resolve_fresh_queued_not_marked_failed(store):
+    task_id = ts.new_task("u", "douyin")  # just created, updated_at ~ now
+    r = ts.resolve_status(task_id)
+    assert r["status"] == "queued"
+
+
 def test_resolve_running_fresh_not_marked_dead(store):
     task_id = ts.new_task("u", "douyin")
     ts.write_task(task_id, status="running", pid=999999, stage="extracting", progress=0.1)
