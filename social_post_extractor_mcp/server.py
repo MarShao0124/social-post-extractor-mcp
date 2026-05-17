@@ -34,7 +34,6 @@ _SERVICE = SocialExtractorService()
 _OWNER_ANALYTICS = OwnerAnalyticsCommandProvider()
 
 
-
 def parse_social_post_info_value(share_link: str) -> dict:
     post = _SERVICE.parse_social_post(share_link)
     return {
@@ -62,7 +61,6 @@ def parse_social_post_info_value(share_link: str) -> dict:
     }
 
 
-
 @mcp.tool()
 def parse_social_post_info(share_link: str) -> str:
     """自动识别抖音或小红书链接并返回结构化信息。"""
@@ -70,9 +68,6 @@ def parse_social_post_info(share_link: str) -> str:
         return json.dumps(parse_social_post_info_value(share_link), ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
-
-
-
 
 
 @mcp.tool()
@@ -149,8 +144,6 @@ def get_douyin_download_link(share_link: str) -> str:
         )
     except Exception as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
-
-
 
 
 _PLATFORM_PATTERNS = [
