@@ -223,11 +223,23 @@ mcporter call 'douyin.parse_social_post_info(share_link: "https://www.bilibili.c
 使用两步异步流程——`submit_transcript` 在 <1s 内返回 `task_id`，再轮询 `get_transcript` 直到状态为 `succeeded` 或 `failed`：
 
 ```bash
-mcporter call 'douyin.submit_transcript(url: “https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share”)'
-# 返回 {“status”:”running”,”task_id”:”<hex32>”,”platform”:”小红书”}
-mcporter call 'douyin.get_transcript(task_id: “上一步返回的 task_id”)'
-# 轮询直到 status 为 “succeeded”（transcript 在 .transcript 字段）或 “failed”
+mcporter call 'douyin.submit_transcript(url: "https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share")'
+# 返回 {"result":"{\"status\":\"running\",\"task_id\":\"<hex32>\",\"platform\":\"小红书\"}"}
+
+# 轮询直到 succeeded / failed —— 用循环，别手搓单次调用
+TASK_ID="上一步返回的 task_id"
+for i in $(seq 1 60); do
+  inner=$(mcporter call "douyin.get_transcript(task_id: \"$TASK_ID\")" 2>/dev/null | jq -r '.result')
+  st=$(printf '%s' "$inner" | jq -r '.status')
+  echo "poll $i: $st $(printf '%s' "$inner" | jq -r '.stage // ""')"
+  case "$st" in succeeded|failed) printf '%s\n' "$inner" | jq .; break ;; esac
+  sleep 12
+done
 ```
+
+> ⚠️ **`mcporter call` 的输出是 `{"result":"<转义的 JSON 字符串>"}`**——`result` 的值本身是字符串，
+> 内部引号是 `\"`。必须 `jq -r '.result'` 取出内层再 `jq` 当 JSON 解；直接 `grep '"status"'` 抓不到。
+> `submit_transcript`/`get_transcript` 每次调用都 <1s，循环里 `sleep` 隔 12–30s 一次即可，永不超时。
 
 如果默认小红书链接失效，再让用户提供一个新的小红书链接；没有真实可用的小红书链接时，只能说”部分验证通过”，不能说”三平台全部通过”。
 
@@ -394,9 +406,9 @@ mcporter call 'douyin.parse_social_post_info(share_link: "平台链接")'
 ## 与上游的差异（Fork Changelog）
 
 相对上游 [`JNHFlow21/social-post-extractor-mcp`](https://github.com/JNHFlow21/social-post-extractor-mcp)
-（fork 基点：`b23bf5a Update installation instructions in README.md`），本 Fork 在
-`social_post_extractor_mcp/social_extractor.py` 与 `social_post_extractor_mcp/server.py`
-两个文件上做了 4 处改动。**功能行为均向后兼容**：原有工具签名不变，仅修复超时、新增工具、改默认值。
+（fork 基点：`b23bf5a Update installation instructions in README.md`），本 Fork 改动集中在
+`social_post_extractor_mcp/social_extractor.py`、`server.py`，并新增了异步任务模块
+`task_store.py`、`worker.py`。**保留工具的签名向后兼容**；旧的 5 个长阻塞工具已被异步接口取代。
 
 ### 1. ffmpeg 音轨预提取（修复跨国 ASR 必超时）
 
@@ -428,6 +440,20 @@ mcporter call 'douyin.parse_social_post_info(share_link: "平台链接")'
 - **为什么**：上游默认 `paraformer-v2` 的异步转写端点要求复数 `input.file_urls`，而本仓库的提交代码发的是
   单数 `input.file_url`，schema 不匹配 → 任务永不返回有效结果 → poll 循环跑到超时。把代码默认值改成
   schema 兼容的模型，确保即使环境变量被重置（如重新注册 mcporter alias）也不会静默重新引入该挂死。
+
+### 5. detached worker：墙钟看门狗 + 中国平台代理旁路
+
+- worker 进程加 `SIGALRM` 看门狗，超 `WORKER_MAX_SECONDS`（默认 1800s）强制写 `failed` 退出，
+  避免无声挂起；`get_transcript` 另有 dead-worker 规则（pid 死亡或 queued/running 停滞 >120s → `failed` + `log_path`）。
+- 抖音/小红书/Bilibili 抽取段临时清除 `*_PROXY` / 置 `NO_PROXY=*`，避免本机代理把中国平台请求劫持到不可达出口。
+
+### 6. scoped fix：百炼 OSS 上传重试 + 每次重取签名 policy
+
+- `upload_local_file_to_dashscope_oss` 改为 3 次重试，**每次重新拉 upload policy / key / form**，
+  指数退避，`timeout=(30, 240)`，3 次仍败抛 `RuntimeError`。
+- **为什么**：百炼 OSS 签名 policy TTL ~5 分钟，重试时复用同一过期 policy 会 `403 Forbidden`；
+  且跨国到北京 OSS 的吞吐逐日波动，单次无重试遇瞬态抖动即整体失败。重试+刷新 policy 扛过可恢复的那类
+  （瞬态网络非代码缺陷，无 VPN 实测仍可成功）。
 
 > 调用与运维细节见使用方个人笔记 `学习笔记/agent-reach.md`（不在本仓库）。
 
