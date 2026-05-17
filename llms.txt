@@ -15,7 +15,7 @@ For AI installation agents:
 4. Guide the user step by step through API Key creation, repo-local config-file setup, MCP config, and smoke tests.
 
 Default model stack:
-- ASR: bailian / paraformer-v2
+- ASR: bailian / qwen3-asr-flash-filetrans
 - Vision OCR: bailian / qwen3-vl-flash
 - Cleanup: bailian / qwen-flash
 

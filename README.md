@@ -117,7 +117,7 @@ Copy-Item .env.example config/social-post-extractor.env
 
 ```bash
 export ASR_PROVIDER=bailian
-export ASR_MODEL=paraformer-v2
+export ASR_MODEL=qwen3-asr-flash-filetrans
 export VISION_PROVIDER=bailian
 export VISION_MODEL=qwen3-vl-flash
 export CLEAN_PROVIDER=bailian

@@ -107,7 +107,7 @@ Edit `config/social-post-extractor.env` with the user's real key:
 
 ```bash
 export ASR_PROVIDER=bailian
-export ASR_MODEL=paraformer-v2
+export ASR_MODEL=qwen3-asr-flash-filetrans
 export VISION_PROVIDER=bailian
 export VISION_MODEL=qwen3-vl-flash
 export CLEAN_PROVIDER=bailian

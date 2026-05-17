@@ -39,7 +39,7 @@
 
 云端模型负责：
 
-- `paraformer-v2`：视频语音转文字
+- `qwen3-asr-flash-filetrans`：视频语音转文字
 - `qwen3-vl-flash`：小红书图文图片读字
 - `qwen-flash`：轻整理，只做分段、标点、少量明显错字修正
 
@@ -55,7 +55,7 @@
       "args": ["-m", "social_post_extractor_mcp"],
       "env": {
         "ASR_PROVIDER": "bailian",
-        "ASR_MODEL": "paraformer-v2",
+        "ASR_MODEL": "qwen3-asr-flash-filetrans",
         "VISION_PROVIDER": "bailian",
         "VISION_MODEL": "qwen3-vl-flash",
         "CLEAN_PROVIDER": "bailian",
