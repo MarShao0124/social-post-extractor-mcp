@@ -37,6 +37,7 @@ def test_submit_spawns_detached_and_returns_task_id(store):
     popen.assert_called_once()
     kwargs = popen.call_args.kwargs
     assert kwargs["start_new_session"] is True
+    assert kwargs["close_fds"] is True
     assert ts.read_task(out["task_id"])["platform"] == "youtube"
 
 

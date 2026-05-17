@@ -184,18 +184,22 @@ def submit_transcript(url: str, asr_model: Optional[str] = None) -> str:
                 {"status": "error", "error": f"无法识别为有效视频 URL: {url[:120]}"},
                 ensure_ascii=False, indent=2,
             )
-        ts.gc_stale()
+        try:
+            ts.gc_stale()
+        except Exception:
+            pass  # GC failure must never block task creation
         task_id = ts.new_task(url, platform)
         if asr_model:
             ts.write_task(task_id, asr_model=asr_model)
-        subprocess.Popen(
-            [sys.executable, "-m", "social_post_extractor_mcp.worker", task_id],
-            stdin=subprocess.DEVNULL,
-            stdout=open(ts.log_path(task_id), "a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+        with open(ts.log_path(task_id), "a") as _log_fd:
+            subprocess.Popen(
+                [sys.executable, "-m", "social_post_extractor_mcp.worker", task_id],
+                stdin=subprocess.DEVNULL,
+                stdout=_log_fd,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
         return json.dumps(
             {"status": "running", "task_id": task_id, "platform": platform},
             ensure_ascii=False, indent=2,
