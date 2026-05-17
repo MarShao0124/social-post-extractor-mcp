@@ -1964,14 +1964,12 @@ def upload_local_file_to_dashscope_oss(
     instead of streaming a remote URL. Used by the DashScope ASR path after
     local ffmpeg audio extraction shrinks the payload (e.g. 141MB video → 3MB mp3).
     """
-    policy_data = get_dashscope_upload_policy(api_key, model_name)
     file_size = file_path.stat().st_size
     if file_size <= 0:
         raise RuntimeError(f"本地文件大小为 0，无法上传到 DashScope 临时存储: {file_path}")
     file_name = filename_hint or file_path.name
     content_type, _ = mimetypes.guess_type(file_name)
     content_type = content_type or "application/octet-stream"
-    key = f"{policy_data['upload_dir'].rstrip('/')}/{file_name}"
 
     def _file_chunks() -> Any:
         with file_path.open("rb") as file_obj:
@@ -1982,7 +1980,15 @@ def upload_local_file_to_dashscope_oss(
                 yield chunk
 
     last_exc: Optional[Exception] = None
+    last_host = ""
     for attempt in range(1, 4):  # 3 attempts
+        # Refetch a fresh signed policy every attempt: the DashScope OSS POST
+        # policy is only valid ~5 min, and a slow cross-border upload (or a
+        # prior failed attempt) can outlast it, yielding a 403. A fresh policy
+        # per attempt gives each try the full validity window.
+        policy_data = get_dashscope_upload_policy(api_key, model_name)
+        last_host = policy_data["upload_host"]
+        key = f"{policy_data['upload_dir'].rstrip('/')}/{file_name}"
         form = StreamingMultipartForm(
             boundary=f"dashscope-{uuid.uuid4().hex}",
             fields=[
@@ -2019,7 +2025,7 @@ def upload_local_file_to_dashscope_oss(
             if attempt < 3:
                 time.sleep(2 ** attempt)  # 2s, 4s backoff
     raise RuntimeError(
-        f"DashScope OSS 上传在 3 次重试后仍失败（{file_size} 字节 → {policy_data['upload_host']}）："
+        f"DashScope OSS 上传在 3 次重试后仍失败（{file_size} 字节 → {last_host}）："
         f"{type(last_exc).__name__}: {last_exc}. 该 OSS 端点跨境上传在当前网络不稳定。"
     ) from last_exc
 
