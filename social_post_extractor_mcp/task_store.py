@@ -34,9 +34,10 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
 
 def read_task(task_id: str) -> Optional[dict[str, Any]]:
     p = task_path(task_id)
-    if not p.exists():
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return None
-    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def new_task(url: str, platform: str) -> str:
