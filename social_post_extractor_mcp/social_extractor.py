@@ -1981,36 +1981,47 @@ def upload_local_file_to_dashscope_oss(
                     break
                 yield chunk
 
-    form = StreamingMultipartForm(
-        boundary=f"dashscope-{uuid.uuid4().hex}",
-        fields=[
-            ("OSSAccessKeyId", policy_data["oss_access_key_id"]),
-            ("Signature", policy_data["signature"]),
-            ("policy", policy_data["policy"]),
-            ("x-oss-object-acl", policy_data["x_oss_object_acl"]),
-            ("x-oss-forbid-overwrite", policy_data["x_oss_forbid_overwrite"]),
-            ("key", key),
-            ("success_action_status", "200"),
-        ],
-        file_field_name="file",
-        file_name=file_name,
-        file_content_type=content_type,
-        file_chunks=_file_chunks(),
-        file_size=file_size,
-    )
-    with requests.Session() as upload_session:
-        upload_session.trust_env = False
-        upload_response = upload_session.post(
-            policy_data["upload_host"],
-            data=form,
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={form.boundary}",
-                "Content-Length": str(len(form)),
-            },
-            timeout=(60, 1800),
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):  # 3 attempts
+        form = StreamingMultipartForm(
+            boundary=f"dashscope-{uuid.uuid4().hex}",
+            fields=[
+                ("OSSAccessKeyId", policy_data["oss_access_key_id"]),
+                ("Signature", policy_data["signature"]),
+                ("policy", policy_data["policy"]),
+                ("x-oss-object-acl", policy_data["x_oss_object_acl"]),
+                ("x-oss-forbid-overwrite", policy_data["x_oss_forbid_overwrite"]),
+                ("key", key),
+                ("success_action_status", "200"),
+            ],
+            file_field_name="file",
+            file_name=file_name,
+            file_content_type=content_type,
+            file_chunks=_file_chunks(),
+            file_size=file_size,
         )
-    upload_response.raise_for_status()
-    return f"oss://{key}"
+        try:
+            with requests.Session() as upload_session:
+                upload_session.trust_env = False
+                upload_response = upload_session.post(
+                    policy_data["upload_host"],
+                    data=form,
+                    headers={
+                        "Content-Type": f"multipart/form-data; boundary={form.boundary}",
+                        "Content-Length": str(len(form)),
+                    },
+                    timeout=(30, 240),
+                )
+            upload_response.raise_for_status()
+            return f"oss://{key}"
+        except (requests.exceptions.RequestException,) as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(2 ** attempt)  # 2s, 4s backoff
+    raise RuntimeError(
+        f"DashScope OSS 上传在 3 次重试后仍失败（{file_size} 字节 → {policy_data['upload_host']}）："
+        f"{type(last_exc).__name__}: {last_exc}. 该 OSS 端点跨境上传在当前网络不稳定。"
+    ) from last_exc
 
 
 def run_dashscope_multimodal_asr(*, oss_url: str, api_key: str, model: str) -> str:

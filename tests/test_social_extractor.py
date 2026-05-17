@@ -959,5 +959,63 @@ class OwnerAnalyticsCommandProviderTests(unittest.TestCase):
         fallback.assert_called_once()
 
 
+class UploadRetryTests(unittest.TestCase):
+    def test_upload_local_file_retries_then_succeeds(self):
+        import social_post_extractor_mcp.social_extractor as se
+        import requests as _rq
+        from unittest import mock
+        import tempfile, pathlib
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "a.mp3"
+        f.write_bytes(b"x" * 1024)
+        policy = {
+            "upload_host": "https://oss.example.com", "upload_dir": "dir",
+            "oss_access_key_id": "k", "signature": "s", "policy": "p",
+            "x_oss_object_acl": "a", "x_oss_forbid_overwrite": "false",
+        }
+        calls = {"n": 0}
+        class _Resp:
+            status_code = 200
+            def raise_for_status(self): pass
+        class _Sess:
+            trust_env = True
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def post(self, *a, **k):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise _rq.exceptions.ReadTimeout("stall")
+                return _Resp()
+        with mock.patch.object(se, "get_dashscope_upload_policy", return_value=policy), \
+             mock.patch.object(se.requests, "Session", return_value=_Sess()), \
+             mock.patch.object(se.time, "sleep", lambda *_: None):
+            url = se.upload_local_file_to_dashscope_oss(
+                file_path=f, api_key="key", model_name="qwen3-asr-flash-filetrans")
+        self.assertTrue(url.startswith("oss://"))
+        self.assertEqual(calls["n"], 3)  # failed twice, succeeded on 3rd
+
+    def test_upload_local_file_raises_after_retries(self):
+        import social_post_extractor_mcp.social_extractor as se
+        import requests as _rq
+        from unittest import mock
+        import tempfile, pathlib
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "a.mp3"; f.write_bytes(b"x" * 1024)
+        policy = {"upload_host": "https://oss.example.com", "upload_dir": "dir",
+            "oss_access_key_id": "k", "signature": "s", "policy": "p",
+            "x_oss_object_acl": "a", "x_oss_forbid_overwrite": "false"}
+        class _Sess:
+            trust_env = True
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def post(self, *a, **k): raise _rq.exceptions.ConnectTimeout("dead")
+        with mock.patch.object(se, "get_dashscope_upload_policy", return_value=policy), \
+             mock.patch.object(se.requests, "Session", return_value=_Sess()), \
+             mock.patch.object(se.time, "sleep", lambda *_: None):
+            with self.assertRaises(RuntimeError):
+                se.upload_local_file_to_dashscope_oss(
+                    file_path=f, api_key="key", model_name="qwen3-asr-flash-filetrans")
+
+
 if __name__ == "__main__":
     unittest.main()
