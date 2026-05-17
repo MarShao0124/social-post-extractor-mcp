@@ -218,20 +218,18 @@ mcporter call 'douyin.parse_social_post_info(share_link: "https://www.xiaohongsh
 mcporter call 'douyin.parse_social_post_info(share_link: "https://www.bilibili.com/video/BV19nwvzkEz3/?share_source=copy_web&vd_source=3e5fb861a7d0d1af1134f023ac01f842")'
 ```
 
-三平台 metadata 测试都通过后，再测试至少一次 transcript 或完整采集。推荐优先测试小红书视频，因为它同时验证小红书解析和视频转写链路：
+三平台 metadata 测试都通过后，再测试至少一次 transcript。推荐优先测试小红书视频，因为它同时验证小红书解析和视频转写链路。
+
+使用两步异步流程——`submit_transcript` 在 <1s 内返回 `task_id`，再轮询 `get_transcript` 直到状态为 `succeeded` 或 `failed`：
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share", output_dir: "/tmp/social-post-extract")'
-mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "抖音视频链接", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: “https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share”)'
+# 返回 {“status”:”running”,”task_id”:”<hex32>”,”platform”:”小红书”}
+mcporter call 'douyin.get_transcript(task_id: “上一步返回的 task_id”)'
+# 轮询直到 status 为 “succeeded”（transcript 在 .transcript 字段）或 “failed”
 ```
 
-如果默认小红书链接失效，再让用户提供一个新的小红书链接；没有真实可用的小红书链接时，只能说“部分验证通过”，不能说“三平台全部通过”。
-
-真实提取 transcript 时建议给 `output_dir`：
-
-```bash
-mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "你的抖音/小红书/Bilibili链接", output_dir: "/tmp/social-post-extract")'
-```
+如果默认小红书链接失效，再让用户提供一个新的小红书链接；没有真实可用的小红书链接时，只能说”部分验证通过”，不能说”三平台全部通过”。
 
 安装完成后，AI Agent 应该先给出类似这样的回执：
 
@@ -265,27 +263,17 @@ OK，MCP 已安装并通过测试。
 直接说：
 
 ```text
-帮我转写这个抖音视频，并保存成 script.md 和 info.json：
+帮我转写这个抖音视频：
 https://v.douyin.com/xxxx/
 ```
 
-Agent 应该调用：
+Agent 应该调用（两步异步，每步 <1s 返回）：
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "抖音链接", output_dir: "/tmp/social-post-extract")'
-```
-
-如果只要文字稿，不需要完整信息：
-
-```text
-帮我只提取这个抖音视频的转写稿：
-https://v.douyin.com/xxxx/
-```
-
-Agent 应该调用：
-
-```bash
-mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "抖音链接", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "抖音链接")'
+# 返回 {"status":"running","task_id":"<hex32>","platform":"抖音"}
+mcporter call 'douyin.get_transcript(task_id: "上一步返回的 task_id")'
+# 轮询直到 status 为 "succeeded"；transcript 在 .transcript 字段，文件路径在 .metadata.script_path / .metadata.info_path
 ```
 
 ### 转写小红书视频
@@ -297,10 +285,13 @@ mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "
 小红书分享链接
 ```
 
-Agent 应该调用：
+Agent 应该调用（两步异步，每步 <1s 返回）：
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "小红书链接", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "小红书链接")'
+# 返回 {"status":"running","task_id":"<hex32>","platform":"小红书"}
+mcporter call 'douyin.get_transcript(task_id: "上一步返回的 task_id")'
+# 轮询直到 status 为 "succeeded"；transcript 在 .transcript 字段，文件路径在 .metadata.script_path / .metadata.info_path
 ```
 
 ### 提取小红书图文笔记
@@ -312,27 +303,31 @@ mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "小红�
 小红书分享链接
 ```
 
-Agent 应该调用：
+Agent 应该调用（两步异步，每步 <1s 返回）：
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "小红书链接", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "小红书链接")'
+# 返回 {"status":"running","task_id":"<hex32>","platform":"小红书"}
+mcporter call 'douyin.get_transcript(task_id: "上一步返回的 task_id")'
+# 轮询直到 status 为 "succeeded"；正文和图片分析在 .transcript，文件路径在 .metadata.script_path / .metadata.info_path
 ```
-
-图文笔记会保存正文、图片 URL，并用视觉模型分析图片内容。
 
 ### 转写 Bilibili 视频
 
 直接说：
 
 ```text
-帮我转写这个 B 站视频，并保存结构化信息：
+帮我转写这个 B 站视频：
 https://www.bilibili.com/video/BVxxxx/
 ```
 
-Agent 应该调用：
+Agent 应该调用（两步异步，每步 <1s 返回）：
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "B站链接", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "B站链接")'
+# 返回 {"status":"running","task_id":"<hex32>","platform":"Bilibili"}
+mcporter call 'douyin.get_transcript(task_id: "上一步返回的 task_id")'
+# 轮询直到 status 为 "succeeded"；transcript 在 .transcript 字段，文件路径在 .metadata.script_path / .metadata.info_path
 ```
 
 ### 只看作者和数据
@@ -352,25 +347,20 @@ mcporter call 'douyin.parse_social_post_info(share_link: "平台链接")'
 
 ### 输出在哪里
 
-默认建议输出到：
+成功后，`get_transcript` 的响应包含：
 
-```text
-/tmp/social-post-extract
-```
-
-每次成功提取后，结果里会返回实际路径：
-
-- `script_path`：整理后的 Markdown 文稿
-- `info_path`：结构化 JSON 数据
+- `.transcript`：转写稿或图文正文（所有平台均有）
+- `.metadata.script_path`：整理后的 Markdown 文稿路径（社交平台专属）
+- `.metadata.info_path`：结构化 JSON 数据路径（社交平台专属）
 
 ## 工具列表
 
 - `parse_social_post_info`：只解析作者、作品、指标和媒体信息，不做 ASR
-- `social_extract_transcript`：提取视频 transcript，优先平台字幕，没有字幕时走云端 ASR
-- `social_capture_url`：统一采集链接，输出 `script.md` 和 `info.json`
-- `extract_social_post_script`：兼容旧入口，功能接近 `social_capture_url`
+- `submit_transcript`：提交异步转写任务，<1s 返回 `task_id`；自动识别抖音/小红书/Bilibili/YouTube/通用平台；参数 `url`（必填）和 `asr_model`（可选）
+- `get_transcript`：查询任务状态；参数 `task_id`（必填）；状态为 `succeeded` 时含 `transcript` 和 `metadata`，状态为 `failed` 时含 `error` 和 `log_path`
+- `extract_transcript_blocking`：Claude Code 专用一步转写（内部提交后轮询）；参数 `url`（必填）、`timeout_sec`（可选）、`asr_model`（可选）；不适合 mcporter（会超时）
 - `social_analyze_owner_posts`：拉取自己账号复盘数据，需要浏览器登录态
-- `parse_douyin_video_info`、`get_douyin_download_link`、`extract_douyin_text`：旧版兼容工具
+- `parse_douyin_video_info`、`get_douyin_download_link`：旧版兼容工具
 
 ## 常见问题
 
@@ -423,18 +413,14 @@ mcporter call 'douyin.parse_social_post_info(share_link: "平台链接")'
 - **为什么**：标量 `60` 限制的是单次 chunk read，不是整段传输；大文件 + 慢链路下单次 read 也可能 <60s
   但整体远超，旧写法语义错误。改成 `(connect, read)` 元组，给慢链路足够 read 预算。
 
-### 3. 新增 `youtube_extract_transcript` 工具（YouTube / Bilibili / 任意 yt-dlp 平台）
+### 3. 新增异步转写工具 `submit_transcript` / `get_transcript` / `extract_transcript_blocking`
 
-- **`server.py`**：新增 `@mcp.tool() youtube_extract_transcript(url, prefer_subtitles, asr_model)`。
-- **`social_extractor.py`**：新增 worker `extract_youtube_transcript_value()` +
-  `_parse_vtt_to_text()`（WebVTT 去时间轴/去连续重复行）+ `_ytdlp_fatal_reason()` /
-  `_YTDLP_FATAL_MARKERS`（地区封锁/私有/会员限定等不可恢复错误**提前快速失败**，不浪费 ~10 分钟跑 ASR
-  撞同一堵墙）。
-- **行为**：先用 yt-dlp 元数据探测平台字幕 → 有则下载 `.vtt` 解析（**零 ASR 费用**）→ 无字幕才抽 mp3
-  上传走 `qwen3-asr-flash-filetrans` 异步 ASR。**从元数据自动检测语言**（zh/en/ja），避免中文模型识别
-  英文音频时的 `SUCCESS_WITH_NO_VALID_FRAGMENT`。
-- 返回 JSON 含 `video_id` / `title` / `channel` / `duration_sec` / `transcript_source`
-  (`"subtitles"` 或 `"asr"`) / `transcript` 等。
+所有平台（抖音/小红书/Bilibili/YouTube/通用）的转写现在统一走异步任务队列，不再使用同步阻塞式接口。
+
+- **`submit_transcript(url, asr_model?)`**：提交任务，<1s 返回 `{"status":"running","task_id":"<hex32>","platform":"..."}`；自动识别抖音/小红书/Bilibili/YouTube/通用平台。
+- **`get_transcript(task_id)`**：查询状态，<1s 返回；`succeeded` 时含 `transcript`（转写稿）和 `metadata`（社交平台含 `script_path`/`info_path`），`failed` 时含 `error` 和 `log_path`。
+- **`extract_transcript_blocking(url, timeout_sec?, asr_model?)`**：Claude Code 专用一步接口，内部调用 submit 后轮询；mcporter 不适用（会在等待期间超时）。
+- **底层行为不变**：yt-dlp 优先检测平台字幕（零 ASR 费用）→ 无字幕才抽 mp3 走 `qwen3-asr-flash-filetrans` 异步 ASR；自动检测语言（zh/en/ja）。
 
 ### 4. 防回退：`DEFAULT_ASR_MODEL` 默认值硬化
 

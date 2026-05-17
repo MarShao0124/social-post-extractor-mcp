@@ -11,9 +11,9 @@ The user should be able to call one MCP server, usually named `douyin`, that sup
 Expected tools:
 
 - `parse_social_post_info`
-- `social_extract_transcript`
-- `social_capture_url`
-- `extract_social_post_script`
+- `submit_transcript`
+- `get_transcript`
+- `extract_transcript_blocking`
 - `social_analyze_owner_posts`
 
 ## Rules
@@ -213,22 +213,22 @@ mcporter call 'douyin.parse_social_post_info(share_link: "https://www.bilibili.c
 
 If the default Xiaohongshu link fails because the platform page expires or blocks access, ask the user for a fresh Xiaohongshu link. Do not claim full three-platform verification until Douyin, Xiaohongshu, and Bilibili all pass.
 
-After metadata parsing passes, test one real transcript/capture path. Prefer the Xiaohongshu video link because it verifies both Xiaohongshu parsing and video ASR:
+After metadata parsing passes, test one real transcript path. Prefer the Xiaohongshu video link because it verifies both Xiaohongshu parsing and video ASR.
+
+Use the two-step async flow — `submit_transcript` returns in <1s, then poll `get_transcript` until status is `succeeded` or `failed`:
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_extract_transcript(share_link: "https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "https://www.xiaohongshu.com/discovery/item/69ee20ef000000003700f942?source=webshare&xhsshare=pc_web&xsec_token=ABSu4AV7InNpMmutizzqOXvEbSYOl4SuMzfQx6rnUVq8Y=&xsec_source=pc_share")'
+# returns {"status":"running","task_id":"<hex32>","platform":"小红书"}
+mcporter call 'douyin.get_transcript(task_id: "TASK_ID_FROM_ABOVE")'
+# poll until status is "succeeded" (transcript in .transcript field) or "failed"
 ```
 
-For Xiaohongshu video or image notes, use full capture:
+For any other link (Douyin, Bilibili, YouTube, or generic), the same two-step applies — `submit_transcript` auto-detects the platform from the URL:
 
 ```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "https://www.xiaohongshu.com/discovery/item/69ec4330000000001a02de7d?source=webshare&xhsshare=pc_web&xsec_token=ABIXZbvap57FaFYWymY6oBwwRkz1Chn1orsWGhjJntXYY=&xsec_source=pc_share", output_dir: "/tmp/social-post-extract")'
-```
-
-For full capture:
-
-```bash
-mcporter call --timeout 86400000 'douyin.social_capture_url(share_link: "USER_LINK", output_dir: "/tmp/social-post-extract")'
+mcporter call 'douyin.submit_transcript(url: "USER_LINK")'
+mcporter call 'douyin.get_transcript(task_id: "TASK_ID_FROM_ABOVE")'
 ```
 
 Only say the MCP is installed successfully when:
@@ -239,7 +239,7 @@ Only say the MCP is installed successfully when:
 - Douyin metadata test passes.
 - Xiaohongshu metadata test passes.
 - Bilibili metadata test passes.
-- At least one transcript or full capture test succeeds and returns `script_path` / `info_path`.
+- At least one `submit_transcript` + `get_transcript` round trip completes with status `succeeded` and returns a non-empty `transcript` field (social platforms also expose `metadata.script_path` / `metadata.info_path`).
 
 ## Step 6: Teach The User How To Use It
 
@@ -248,20 +248,20 @@ After all required tests pass, first say `OK，MCP 已安装并通过三平台�
 Recommended user prompts and agent actions:
 
 - User says: `帮我转写这个抖音视频：LINK`
-  - Call `social_capture_url` if they want files, or `social_extract_transcript` if they only want transcript.
+  - Call `submit_transcript(url: "LINK")`, then poll `get_transcript(task_id: ...)` until `succeeded`. The transcript is in the `transcript` field; social-platform results also expose `metadata.script_path` / `metadata.info_path`.
 - User says: `帮我转写这个小红书视频笔记：LINK`
-  - Call `social_capture_url`.
+  - Call `submit_transcript(url: "LINK")`, then poll `get_transcript(task_id: ...)` until `succeeded`.
 - User says: `帮我提取这个小红书图文笔记的正文、图片内容和数据：LINK`
-  - Call `social_capture_url`.
+  - Call `submit_transcript(url: "LINK")`, then poll `get_transcript(task_id: ...)` until `succeeded`. File paths are in `metadata.script_path` / `metadata.info_path`.
 - User says: `帮我转写这个 B 站视频：LINK`
-  - Call `social_capture_url`.
+  - Call `submit_transcript(url: "LINK")`, then poll `get_transcript(task_id: ...)` until `succeeded`.
 - User says: `帮我看一下这个链接的作者、标题和数据，不用转写：LINK`
   - Call `parse_social_post_info`.
 
-Always tell the user where the output files are:
+Always tell the user where the output files are (social platforms only):
 
-- `script_path` for the Markdown script.
-- `info_path` for structured JSON.
+- `metadata.script_path` for the Markdown script.
+- `metadata.info_path` for structured JSON.
 
 ## Step 7: Optional Owner Analytics
 
@@ -294,8 +294,8 @@ When setup is complete, tell the user:
 - Which API key file is being used, usually `config/social-post-extractor.env`, without revealing the key.
 - How to use the main tools:
   - `parse_social_post_info` for metadata only
-  - `social_extract_transcript` for transcript
-  - `social_capture_url` for full capture
+  - `submit_transcript` + `get_transcript` for async transcript (two-step; each call returns in <1s)
+  - `extract_transcript_blocking` for one-shot transcript in Claude Code (submits then polls internally; not suitable for mcporter)
   - `social_analyze_owner_posts` for own-account review
 
 If setup fails, report:
@@ -319,11 +319,11 @@ OK，MCP 已安装并通过三平台测试。
 - 抖音 metadata：通过，作品 ID：...
 - 小红书 metadata：通过，作品 ID：...
 - Bilibili metadata：通过，作品 ID：...
-- 转写/完整采集：通过
+- 转写（submit_transcript + get_transcript）：通过，transcript 已返回
 
-输出文件：
-- script.md：...
-- info.json：...
+输出文件（社交平台，来自 get_transcript 的 metadata 字段）：
+- metadata.script_path：...
+- metadata.info_path：...
 
 以后你可以这样用：
 - 帮我转写这个抖音视频：链接

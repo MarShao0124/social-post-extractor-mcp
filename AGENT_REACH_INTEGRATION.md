@@ -73,12 +73,11 @@
 
 - `parse_douyin_video_info`
 - `get_douyin_download_link`
-- `extract_douyin_text`
 
-同时新增统一工具：
+当前推荐的统一工具：
 
-- `parse_social_post_info`
-- `extract_social_post_script`
+- `parse_social_post_info`：仅获取元数据，不做 ASR
+- `submit_transcript` + `get_transcript`：异步两步转写；`submit_transcript` 提交任务（<1s），`get_transcript` 轮询直到 `succeeded`（含 `transcript` 和 `metadata`）或 `failed`
 
 这意味着原有 skill 不需要改提示词，也能继续工作；如果要利用小红书和统一产物，优先调用新工具。
 
