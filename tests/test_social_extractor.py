@@ -153,7 +153,7 @@ class SocialExtractorServiceTests(unittest.TestCase):
 
     def test_defaults_prefer_bailian_simple_stack(self):
         self.assertEqual(DEFAULT_ASR_PROVIDER, "bailian")
-        self.assertEqual(DEFAULT_ASR_MODEL, "paraformer-v2")
+        self.assertEqual(DEFAULT_ASR_MODEL, "qwen3-asr-flash-filetrans")
         self.assertEqual(default_model_for_provider("bailian", "vision"), "qwen3-vl-flash")
         self.assertEqual(default_model_for_provider("bailian", "cleanup"), "qwen-flash")
 
