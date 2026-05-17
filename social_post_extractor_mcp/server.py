@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,11 +16,10 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from .env_loader import load_default_env_files
 from .social_extractor import (
-    DEFAULT_ASR_PROVIDER,
     OwnerAnalyticsCommandProvider,
     SocialExtractorService,
-    extract_youtube_transcript_value,
 )
+from . import task_store as ts
 
 
 load_default_env_files(Path(__file__).resolve().parents[1])
@@ -30,11 +33,6 @@ mcp = FastMCP(
 _SERVICE = SocialExtractorService()
 _OWNER_ANALYTICS = OwnerAnalyticsCommandProvider()
 
-
-def _detect_legacy_asr_provider(model: Optional[str]) -> str:
-    if model and "paraformer" in model.lower():
-        return "bailian"
-    return os.getenv("ASR_PROVIDER") or DEFAULT_ASR_PROVIDER
 
 
 def parse_social_post_info_value(share_link: str) -> dict:
@@ -64,33 +62,6 @@ def parse_social_post_info_value(share_link: str) -> dict:
     }
 
 
-def extract_social_post_script_value(
-    share_link: str,
-    *,
-    output_dir: Optional[str] = None,
-    asr_provider: Optional[str] = None,
-    asr_model: Optional[str] = None,
-    vision_provider: Optional[str] = None,
-    vision_model: Optional[str] = None,
-    clean_provider: Optional[str] = None,
-    clean_model: Optional[str] = None,
-    save_raw_segments: bool = False,
-) -> dict:
-    # Ignore asr_provider if passed as "siliconflow" - use env var instead
-    # This ensures ASR_PROVIDER=bailian in mcporter.json takes precedence
-    resolved_asr = os.getenv("ASR_PROVIDER") if asr_provider == "siliconflow" else asr_provider
-    return _SERVICE.extract_social_post(
-        share_link,
-        output_dir=output_dir,
-        asr_provider=resolved_asr,
-        asr_model=asr_model,
-        vision_provider=vision_provider,
-        vision_model=vision_model,
-        clean_provider=clean_provider,
-        clean_model=clean_model,
-        save_raw_segments=save_raw_segments,
-    )
-
 
 @mcp.tool()
 def parse_social_post_info(share_link: str) -> str:
@@ -101,107 +72,7 @@ def parse_social_post_info(share_link: str) -> str:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-def extract_social_post_script(
-    share_link: str,
-    output_dir: Optional[str] = None,
-    asr_provider: Optional[str] = None,
-    asr_model: Optional[str] = None,
-    vision_provider: Optional[str] = None,
-    vision_model: Optional[str] = None,
-    clean_provider: Optional[str] = None,
-    clean_model: Optional[str] = None,
-    save_raw_segments: bool = False,
-) -> str:
-    """
-    自动识别抖音或小红书链接，并输出 script.md 与 info.json。
 
-    默认行为：
-    - 抖音/小红书视频：提取语音脚本
-    - 小红书图文：提取正文和图片文字
-    """
-    try:
-        result = extract_social_post_script_value(
-            share_link,
-            output_dir=output_dir,
-            asr_provider=asr_provider,
-            asr_model=asr_model,
-            vision_provider=vision_provider,
-            vision_model=vision_model,
-            clean_provider=clean_provider,
-            clean_model=clean_model,
-            save_raw_segments=save_raw_segments,
-        )
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def social_capture_url(
-    share_link: str,
-    output_dir: Optional[str] = None,
-    asr_provider: Optional[str] = None,
-    asr_model: Optional[str] = None,
-    vision_provider: Optional[str] = None,
-    vision_model: Optional[str] = None,
-    clean_provider: Optional[str] = None,
-    clean_model: Optional[str] = None,
-    save_raw_segments: bool = False,
-) -> str:
-    """
-    统一采集抖音、小红书、Bilibili 链接，输出 script.md 和 info.json。
-
-    返回值包含作者信息、作品指标、媒体信息、transcript 和图片分析结果。
-    """
-    try:
-        result = extract_social_post_script_value(
-            share_link,
-            output_dir=output_dir,
-            asr_provider=asr_provider,
-            asr_model=asr_model,
-            vision_provider=vision_provider,
-            vision_model=vision_model,
-            clean_provider=clean_provider,
-            clean_model=clean_model,
-            save_raw_segments=save_raw_segments,
-        )
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def social_extract_transcript(
-    share_link: str,
-    output_dir: Optional[str] = None,
-    asr_provider: Optional[str] = None,
-    asr_model: Optional[str] = None,
-) -> str:
-    """提取视频 transcript。优先使用平台字幕，没有字幕时走配置的云端 ASR。"""
-    try:
-        result = extract_social_post_script_value(
-            share_link,
-            output_dir=output_dir,
-            asr_provider=asr_provider,
-            asr_model=asr_model,
-        )
-        info = result.get("info") or {}
-        return json.dumps(
-            {
-                "status": info.get("status", "success"),
-                "platform": result.get("platform"),
-                "content_type": result.get("content_type"),
-                "post_id": result.get("post_id"),
-                "transcript": info.get("transcript") or {"source": None, "text": result.get("raw_transcript")},
-                "script_path": result.get("script_path"),
-                "info_path": result.get("info_path"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    except Exception as exc:
-        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -280,50 +151,108 @@ def get_douyin_download_link(share_link: str) -> str:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
 
 
+
+
+_PLATFORM_PATTERNS = [
+    ("douyin", re.compile(r"douyin\.com|iesdouyin", re.I)),
+    ("xiaohongshu", re.compile(r"xiaohongshu\.com|xhslink", re.I)),
+    ("bilibili", re.compile(r"bilibili\.com|b23\.tv", re.I)),
+    ("youtube", re.compile(r"youtube\.com|youtu\.be", re.I)),
+]
+
+
+def _detect_platform(text: str) -> str:
+    for name, pat in _PLATFORM_PATTERNS:
+        if pat.search(text):
+            return name
+    if re.search(r"https?://", text):
+        return "generic"
+    return ""
+
+
 @mcp.tool()
-def youtube_extract_transcript(
-    url: str,
-    prefer_subtitles: bool = True,
-    asr_model: Optional[str] = None,
-) -> str:
-    """提取 YouTube / B站 / 任意 yt-dlp 支持平台的视频文本。
+def submit_transcript(url: str, asr_model: Optional[str] = None) -> str:
+    """提交一个转写任务，立即返回 task_id（<1s，不会超时）。
 
-    策略：
-        - prefer_subtitles=True (默认): 先用 yt-dlp 抓平台字幕 (.subtitles 或 .automatic_captions)，
-          有字幕则解析 .vtt 返回，无 ASR 费用。
-        - 无字幕回退: yt-dlp 抽 mp3 音轨 → 上传百炼 OSS → qwen3-asr-flash-filetrans 异步 ASR。
-
-    返回 JSON 含 video_id / title / channel / duration_sec / transcript_source ('subtitles' 或 'asr') / transcript。
+    用 get_transcript(task_id) 轮询结果。支持抖音/小红书/B站/YouTube/通用视频 URL。
+    这是 mcporter 等有 60s 限制的客户端应使用的入口。
     """
     try:
-        result = extract_youtube_transcript_value(
-            url, prefer_subtitles=prefer_subtitles, asr_model=asr_model,
+        platform = _detect_platform(url)
+        if not platform:
+            return json.dumps(
+                {"status": "error", "error": f"无法识别为有效视频 URL: {url[:120]}"},
+                ensure_ascii=False, indent=2,
+            )
+        ts.gc_stale()
+        task_id = ts.new_task(url, platform)
+        if asr_model:
+            ts.write_task(task_id, asr_model=asr_model)
+        subprocess.Popen(
+            [sys.executable, "-m", "social_post_extractor_mcp.worker", task_id],
+            stdin=subprocess.DEVNULL,
+            stdout=open(ts.log_path(task_id), "a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
         )
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"status": "running", "task_id": task_id, "platform": platform},
+            ensure_ascii=False, indent=2,
+        )
     except Exception as exc:
-        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2)
+        return json.dumps({"status": "error", "error": str(exc)},
+                          ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
-def extract_douyin_text(
-    share_link: str,
-    model: Optional[str] = None,
+def get_transcript(task_id: str) -> str:
+    """读取 submit_transcript 任务的状态/结果。<1s。
+
+    status: queued|running|succeeded|failed|error。
+    succeeded 时含 transcript 与 metadata；failed 时含 error 与 log_path。
+    """
+    try:
+        return json.dumps(ts.resolve_status(task_id), ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"status": "error", "error": str(exc)},
+                          ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def extract_transcript_blocking(
+    url: str,
+    timeout_sec: int = 900,
+    asr_model: Optional[str] = None,
     ctx: Context = None,
 ) -> str:
-    """兼容旧接口：返回抖音视频原始转写文本。"""
+    """⚠️ 仅供 Claude Code 等可长连接客户端。会在 mcporter 上 60s 超时——
+    那里请改用 submit_transcript / get_transcript。
+
+    内部先 submit（任务已落盘，连接断了仍可用 get_transcript(task_id) 找回），
+    再轮询直到完成或 timeout_sec。
+    """
     try:
-        if ctx:
-            ctx.info("正在通过统一提取管线处理抖音视频...")
-        result = extract_social_post_script_value(
-            share_link,
-            asr_provider=_detect_legacy_asr_provider(model),
-            asr_model=model,
+        submitted = json.loads(submit_transcript(url, asr_model=asr_model))
+        if submitted.get("status") != "running":
+            return json.dumps(submitted, ensure_ascii=False, indent=2)
+        task_id = submitted["task_id"]
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            res = ts.resolve_status(task_id)
+            if ctx:
+                ctx.info(f"[{res.get('status')}] {res.get('stage')} {res.get('progress')}")
+            if res["status"] in ("succeeded", "failed", "error"):
+                return json.dumps(res, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"status": "running", "task_id": task_id,
+             "note": f"未在 {timeout_sec}s 内完成，请用 get_transcript({task_id}) 继续轮询"},
+            ensure_ascii=False, indent=2,
         )
-        return result.get("raw_transcript") or result.get("script_preview") or ""
     except Exception as exc:
-        if ctx:
-            ctx.error(str(exc))
-        raise
+        return json.dumps({"status": "error", "error": str(exc)},
+                          ensure_ascii=False, indent=2)
 
 
 @mcp.prompt()
@@ -337,28 +266,24 @@ def social_post_extraction_guide() -> str:
 - 小红书视频笔记
 - 小红书图文笔记
 - Bilibili 视频
+- YouTube 视频
 
-## 推荐工具
-- `social_capture_url`: 统一采集链接并生成 script.md 和 info.json
-- `social_extract_transcript`: 只关心视频 transcript 时使用
+## 推荐工具（异步，无超时问题）
+- `submit_transcript`: 提交转写任务，立即返回 task_id（<1s）
+- `get_transcript`: 轮询 submit_transcript 任务状态/结果（<1s）
+- `extract_transcript_blocking`: 仅供 Claude Code 等长连接客户端，内部 submit+轮询
+- `parse_social_post_info`: 只解析基础信息（平台、作者、指标等）
+- `parse_douyin_video_info`: 解析抖音视频信息
+- `get_douyin_download_link`: 获取抖音无水印下载链接
 - `social_analyze_owner_posts`: 拉取自己账号的复盘数据
-- `parse_social_post_info`: 只解析基础信息
-- `extract_social_post_script`: 生成 script.md 和 info.json
 
-## 兼容旧工具
-- `parse_douyin_video_info`
-- `get_douyin_download_link`
-- `extract_douyin_text`
-
-## 默认输出
-- `script.md`: 整理稿 + 原始内容
-- `info.json`: 结构化 metadata、作者信息、公开视频指标、媒体信息、transcript、图片分析、模型信息和状态
+## 典型用法（mcporter 等有 60s 限制的客户端）
+1. `submit_transcript(url)` → 获得 task_id
+2. 每隔几秒调用 `get_transcript(task_id)` 直到 status == "succeeded"
 
 ## 模型切换
 支持通过环境变量设置默认 provider/model，也支持在单次调用时覆盖：
-- ASR: `asr_provider` / `asr_model`
-- Vision: `vision_provider` / `vision_model`
-- Cleanup: `clean_provider` / `clean_model`
+- ASR: `asr_model`
 """
 
 
