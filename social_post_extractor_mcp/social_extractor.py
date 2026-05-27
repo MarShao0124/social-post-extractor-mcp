@@ -52,6 +52,20 @@ DEFAULT_CLEAN_PROVIDER = "bailian"
 DEFAULT_DASHSCOPE_SHORT_ASR_MODEL = "qwen3-asr-flash"
 DEFAULT_DASHSCOPE_LONG_ASR_MODEL = "qwen3-asr-flash-filetrans"
 DEFAULT_DASHSCOPE_SHORT_MAX_DURATION_SEC = 300
+# NOTE(local-fork): cross-border uploads to dashscope-file-mgr.oss-cn-beijing
+# can ReadTimeout on payloads >~4MB even after 3 retries with fresh policies.
+# We mitigate in two stages:
+#   1. ASR-optimal re-encode (mono/16kHz/64kbps mp3) — speech ASR resamples
+#      to 16kHz internally so the larger q=0 mp3 wastes payload only.
+#   2. If the compact audio still exceeds the threshold, split by time and
+#      upload+transcribe each segment, then concatenate.
+# Both are bounded to the DashScope filetrans cloud-mirror path; other ASR
+# providers (SiliconFlow / Volcengine / OpenAI-compatible) keep using the
+# original extract_audio so their endpoints' behavior is unchanged.
+DASHSCOPE_OSS_CHUNK_THRESHOLD_BYTES = int(
+    os.environ.get("DASHSCOPE_OSS_CHUNK_THRESHOLD_BYTES", str(2 * 1024 * 1024))
+)
+DASHSCOPE_ASR_BITRATE = os.environ.get("DASHSCOPE_ASR_BITRATE", "64k")
 DOUYIN_CREATOR_OVERVIEW_LABELS = {
     "play": "播放量",
     "profile": "主页访问量",
@@ -925,33 +939,80 @@ class DashScopeASRProvider:
 
     def _transcribe_via_cloud_mirror(self, post: SocialPost, *, api_key: str, model: str) -> str:
         # Local ffmpeg preprocessing: download video → extract audio → upload only the audio.
-        # The previous implementation streamed the full remote video into DashScope OSS,
-        # which is ~141MB for a typical Douyin clip and triggers OSS 60s read timeout from
-        # outside China. Extracting audio first shrinks the upload by ~30-50x and uses the
-        # same async ASR path on the cloud side.
+        # Original upstream uploaded the full remote video (~141MB) into DashScope OSS and
+        # hit OSS read-timeout from outside China. Two-stage shrink:
+        #   1. ASR-optimal re-encode (mono/16kHz/64kbps mp3) instead of q=0 — speech ASR
+        #      resamples to 16kHz anyway, so q=0's extra bitrate is wasted bytes.
+        #   2. Threshold-gated time-segment split: if the compact audio still exceeds
+        #      DASHSCOPE_OSS_CHUNK_THRESHOLD_BYTES, ffmpeg-segment + upload + transcribe
+        #      each piece, then concatenate. Single-payload OSS failure mode is the
+        #      whole-request 240s read timeout, so smaller pieces succeed independently
+        #      even when the aggregate would not.
         media_filename = _default_dashscope_media_filename(post)
         audio_filename = Path(media_filename).with_suffix(".mp3").name
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             video_path = download_binary(post.video_url, tmp_path / f"{post.post_id}.mp4")
-            audio_path = extract_audio(video_path, tmp_path / f"{post.post_id}.mp3")
-            oss_url = upload_local_file_to_dashscope_oss(
-                file_path=audio_path,
-                api_key=api_key,
-                model_name=model,
-                filename_hint=audio_filename,
+            audio_path = extract_compact_audio_for_asr(
+                video_path, tmp_path / f"{post.post_id}.mp3"
             )
-        if model == DEFAULT_DASHSCOPE_SHORT_ASR_MODEL:
-            return run_dashscope_multimodal_asr(
-                oss_url=oss_url,
-                api_key=api_key,
-                model=model,
-            )
-        return run_dashscope_filetrans_task(
-            oss_url=oss_url,
-            api_key=api_key,
-            model=model,
-        )
+            audio_size = audio_path.stat().st_size
+
+            # Multimodal (short-ASR) path: concat-join not natural; keep single upload.
+            if model == DEFAULT_DASHSCOPE_SHORT_ASR_MODEL:
+                oss_url = upload_local_file_to_dashscope_oss(
+                    file_path=audio_path,
+                    api_key=api_key,
+                    model_name=model,
+                    filename_hint=audio_filename,
+                )
+                return run_dashscope_multimodal_asr(
+                    oss_url=oss_url,
+                    api_key=api_key,
+                    model=model,
+                )
+
+            # filetrans path: chunk if over threshold.
+            if audio_size <= DASHSCOPE_OSS_CHUNK_THRESHOLD_BYTES:
+                oss_url = upload_local_file_to_dashscope_oss(
+                    file_path=audio_path,
+                    api_key=api_key,
+                    model_name=model,
+                    filename_hint=audio_filename,
+                )
+                return run_dashscope_filetrans_task(
+                    oss_url=oss_url,
+                    api_key=api_key,
+                    model=model,
+                )
+
+            duration_sec = _probe_audio_duration_sec(audio_path)
+            # Target ~80% of threshold per chunk to leave headroom; floor at 30s
+            # so very-low-bitrate edge cases don't generate sub-second segments.
+            target_bytes = int(DASHSCOPE_OSS_CHUNK_THRESHOLD_BYTES * 0.8)
+            bytes_per_sec = max(audio_size / max(duration_sec, 1.0), 1.0)
+            segment_sec = max(int(target_bytes / bytes_per_sec), 30)
+            segments = segment_audio_by_time(audio_path, tmp_path, segment_sec)
+            if not segments:
+                raise RuntimeError("audio segmentation produced no output segments")
+
+            audio_stem = Path(audio_filename).stem
+            transcripts: list[str] = []
+            for idx, seg in enumerate(segments, 1):
+                seg_filename = f"{audio_stem}_part{idx}.mp3"
+                oss_url = upload_local_file_to_dashscope_oss(
+                    file_path=seg,
+                    api_key=api_key,
+                    model_name=model,
+                    filename_hint=seg_filename,
+                )
+                text = run_dashscope_filetrans_task(
+                    oss_url=oss_url,
+                    api_key=api_key,
+                    model=model,
+                )
+                transcripts.append(text.strip())
+            return "\n\n".join(t for t in transcripts if t)
 
 
 class OpenAICompatibleASRProvider:
@@ -2260,6 +2321,61 @@ def extract_audio(video_path: Path, audio_path: Path) -> Path:
         .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
     )
     return audio_path
+
+
+def extract_compact_audio_for_asr(video_path: Path, audio_path: Path) -> Path:
+    """ASR-optimal mp3: mono / 16kHz / DASHSCOPE_ASR_BITRATE (default 64k).
+
+    Speech ASR (qwen3-asr-flash family + paraformer) downsamples to 16kHz mono
+    internally; the default extract_audio(q=0) mp3 ships ~245kbps stereo which
+    is pure payload waste for ASR. This variant trades ~0% recognition quality
+    for ~8x smaller upload — critical for cross-border DashScope OSS reliability.
+    """
+    import ffmpeg
+
+    (
+        ffmpeg.input(str(video_path))
+        .output(
+            str(audio_path),
+            acodec="libmp3lame",
+            ac=1,
+            ar=16000,
+            **{"b:a": DASHSCOPE_ASR_BITRATE},
+        )
+        .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+    )
+    return audio_path
+
+
+def segment_audio_by_time(audio_path: Path, out_dir: Path, segment_sec: int) -> list[Path]:
+    """Split audio into time-based segments via ffmpeg `-f segment`.
+
+    Uses stream-copy (no re-encode) so segmentation is fast and lossless. Each
+    output piece is an independently-decodable mp3 suitable for upload as a
+    standalone ASR job.
+    """
+    import ffmpeg
+
+    pattern = str(out_dir / f"{audio_path.stem}_part%03d.mp3")
+    (
+        ffmpeg.input(str(audio_path))
+        .output(
+            pattern,
+            acodec="copy",
+            f="segment",
+            segment_time=segment_sec,
+            reset_timestamps=1,
+        )
+        .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+    )
+    return sorted(out_dir.glob(f"{audio_path.stem}_part*.mp3"))
+
+
+def _probe_audio_duration_sec(audio_path: Path) -> float:
+    import ffmpeg
+
+    info = ffmpeg.probe(str(audio_path))
+    return float(info["format"]["duration"])
 
 
 def extract_wav_audio(video_path: Path, audio_path: Path) -> Path:
